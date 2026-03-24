@@ -5,7 +5,7 @@ urlencode() {
 }
 
 parse_csv_line() {
-    local line="$1"
+    local line="${1//$'\r'/}"
     local -a fields=()
     local field=""
     local in_quotes=false
@@ -68,7 +68,7 @@ if [ ! -f "$csv_path" ]; then
     exit 1
 else
     echo -e "\nReading input from file: '$csv_path'"
-    header_line="$(head -n 1 "$csv_path")"
+    header_line="$(head -n 1 "$csv_path" | tr -d '\r' | sed $'s/^\xef\xbb\xbf//')"
     if [[ -z "${header_line//[[:space:]]/}" ]]; then
         echo -e "\033[31m[ERROR] CSV header validation failed. File does not contain a valid header row.\033[0m"
         echo -e "\033[33mExpected columns: org, teamproject, repo\033[0m"
