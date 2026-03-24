@@ -101,6 +101,18 @@ else
         exit 1
     fi
 
+    # Determine column indices from header
+    col_org=-1
+    col_teamproject=-1
+    col_repo=-1
+    for idx in "${!norm_headers[@]}"; do
+        case "${norm_headers[$idx]}" in
+            org)         col_org=$idx ;;
+            teamproject) col_teamproject=$idx ;;
+            repo)        col_repo=$idx ;;
+        esac
+    done
+
     # Ensure at least one data row exists
     if ! tail -n +2 "$csv_path" | grep -q '[^[:space:]]'; then
         echo -e "\033[31m[ERROR] CSV file contains valid headers but no repository entries.\033[0m"
@@ -118,7 +130,7 @@ while IFS= read -r line; do
   readarray -t fields < <(parse_csv_line "$line")
   [[ ${#fields[@]} -lt 1 ]] && continue
 
-  ado_org="$(echo "${fields[0]}" | sed 's/^"//;s/"$//' | xargs)"
+  ado_org="$(echo "${fields[$col_org]}" | sed 's/^"//;s/"$//' | xargs)"
   [[ -z "$ado_org" ]] && continue
 
   unique_orgs["$ado_org"]=1
@@ -171,9 +183,9 @@ while IFS= read -r line; do
 
     if [ ${#fields[@]} -ge 3 ]; then
         # Clean up quotes if present
-        ado_org=$(echo "${fields[0]}" | sed 's/^"//;s/"$//')
-        ado_project=$(echo "${fields[1]}" | sed 's/^"//;s/"$//')
-        selected_repo_name=$(echo "${fields[2]}" | sed 's/^"//;s/"$//')
+        ado_org=$(echo "${fields[$col_org]}" | sed 's/^"//;s/"$//')
+        ado_project=$(echo "${fields[$col_teamproject]}" | sed 's/^"//;s/"$//')
+        selected_repo_name=$(echo "${fields[$col_repo]}" | sed 's/^"//;s/"$//')
 
         enc_ado_org="$(urlencode "$ado_org")"
         enc_ado_project="$(urlencode "$ado_project")"
@@ -234,9 +246,9 @@ while IFS= read -r line; do
     readarray -t fields < <(parse_csv_line "$line")
 
     if [ ${#fields[@]} -ge 3 ]; then
-        ado_org=$(echo "${fields[0]}" | sed 's/^"//;s/"$//')
-        ado_project=$(echo "${fields[1]}" | sed 's/^"//;s/"$//')
-        repo_name=$(echo "${fields[2]}" | sed 's/^"//;s/"$//')
+        ado_org=$(echo "${fields[$col_org]}" | sed 's/^"//;s/"$//')
+        ado_project=$(echo "${fields[$col_teamproject]}" | sed 's/^"//;s/"$//')
+        repo_name=$(echo "${fields[$col_repo]}" | sed 's/^"//;s/"$//')
         project_combo="$ado_org|$ado_project"
 
         # Check if already exists
