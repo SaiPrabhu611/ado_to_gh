@@ -376,3 +376,11 @@ else
     # Clean: no failures, no active items
     echo -e "\n\033[32mNo active pull requests or pipelines detected. You can proceed with migration.\033[0m\n"
 fi
+
+
+
+# Please find the attached bash script, that I am working on to do following enhancement.
+# When checking the active pipeline, currently, all active pipeline from the ADO project will displayed in summary. We need to filter to get active pipelines only from repository that are present in repos.csv. I have made changes to the bash script to filter YAML pipelines only for the repos present in repos.csv and tested it. So far it is working. But the following things are yet to be done
+# Add filter to check active release pipelines for repos that are present in repos.csv
+# After completing the changes, test the script and verify if both YAML and Release pipelines are filtered only for the repos that are present in repos.csv
+# I have worked only in bash for now, once bash is completed, we can implement the same change to PowerShell script also.
