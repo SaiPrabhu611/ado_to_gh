@@ -55,6 +55,11 @@ build_check_failed=false
 release_check_failed=false
 pr_check_failed=false
 
+# Associative array to store repo IDs per project (key: "org|project", value: space-separated repo IDs)
+declare -A PROJECT_REPO_IDS
+# Associative array to store repo names per project for release pipeline filtering
+declare -A PROJECT_REPO_NAMES
+
 # Read CSV file
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 csv_path="$script_dir/repos.csv"
@@ -214,7 +219,7 @@ while IFS= read -r line; do
     fi
 done < "$csv_path"
 
-# Get unique projects
+# Get unique projects and collect repo IDs/names for pipeline filtering
 unique_projects=()
 line_num=0
 while IFS= read -r line; do
@@ -228,14 +233,42 @@ while IFS= read -r line; do
     # Parse the CSV line
     readarray -t fields < <(parse_csv_line "$line")
 
-    if [ ${#fields[@]} -ge 2 ]; then
+    if [ ${#fields[@]} -ge 3 ]; then
         ado_org=$(echo "${fields[0]}" | sed 's/^"//;s/"$//')
         ado_project=$(echo "${fields[1]}" | sed 's/^"//;s/"$//')
+        repo_name=$(echo "${fields[2]}" | sed 's/^"//;s/"$//')
         project_combo="$ado_org|$ado_project"
 
         # Check if already exists
         if [[ ! " ${unique_projects[*]} " =~ " ${project_combo} " ]]; then
             unique_projects+=("$project_combo")
+        fi
+
+        # Get repo ID and add to PROJECT_REPO_IDS
+        enc_ado_org="$(urlencode "$ado_org")"
+        enc_ado_project="$(urlencode "$ado_project")"
+        enc_repo_name="$(urlencode "$repo_name")"
+        
+        repo_uri="https://dev.azure.com/$enc_ado_org/$enc_ado_project/_apis/git/repositories/${enc_repo_name}?api-version=7.1"
+        repo_response=$(curl -s -H "Authorization: Bearer $ADO_PAT" -H "Content-Type: application/json" "$repo_uri" 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$repo_response" ]; then
+            repo_id=$(echo "$repo_response" | jq -r '.id // empty' 2>/dev/null)
+            if [ -n "$repo_id" ] && [ "$repo_id" != "null" ]; then
+                # Append repo ID to the project's list (space-separated)
+                if [ -n "${PROJECT_REPO_IDS[$project_combo]}" ]; then
+                    PROJECT_REPO_IDS[$project_combo]="${PROJECT_REPO_IDS[$project_combo]} $repo_id"
+                else
+                    PROJECT_REPO_IDS[$project_combo]="$repo_id"
+                fi
+                # Append repo name to the project's list (space-separated, lowercase for comparison)
+                repo_name_lower=$(echo "$repo_name" | tr '[:upper:]' '[:lower:]')
+                if [ -n "${PROJECT_REPO_NAMES[$project_combo]}" ]; then
+                    PROJECT_REPO_NAMES[$project_combo]="${PROJECT_REPO_NAMES[$project_combo]} $repo_name_lower"
+                else
+                    PROJECT_REPO_NAMES[$project_combo]="$repo_name_lower"
+                fi
+            fi
         fi
     fi
 done < "$csv_path"
@@ -255,15 +288,18 @@ for project in "${unique_projects[@]}"; do
     if [ $? -eq 0 ] && [ -n "$builds_response" ]; then
         repo_ids="${PROJECT_REPO_IDS["$ado_org|$ado_project"]}"
 
-        # Parse builds and filter for running/queued ones
-        # Build parsing section
-        while IFS='|' read -r pipeline_name status runUrl; do
-        if [[ -n "$pipeline_name" && "$pipeline_name" != "null" ]]; then
-           running_build_summary+=("$ado_project|$repo|$pipeline_name|$status")
-           running_build_links+=("$runUrl")
-       fi
-       done < <(echo "$builds_response" | jq -r --arg repos "$repo_ids" '.value[]? | select(.status == "inProgress" or .status == "notStarted") | 
-select(.sourceRepository.id as $rid | ($repos | split(" ") | index($rid)) != null) | "\(.sourceRepository.name) | "\(.definition.name)|In Progress/Queued|\(._links.web.href)" ' 2>/dev/null)
+        # Parse builds and filter for running/queued ones that belong to repos in CSV
+        while IFS='|' read -r repo_name pipeline_name status runUrl; do
+            if [[ -n "$pipeline_name" && "$pipeline_name" != "null" ]]; then
+                running_build_summary+=("$ado_project|$repo_name|$pipeline_name|$status")
+                running_build_links+=("$runUrl")
+            fi
+        done < <(echo "$builds_response" | jq -r --arg repos "$repo_ids" '
+            .value[]? | 
+            select(.status == "inProgress" or .status == "notStarted") | 
+            select(.repository.id as $rid | ($repos | split(" ") | map(select(. != "")) | index($rid)) != null) | 
+            "\(.repository.name)|\(.definition.name)|In Progress/Queued|\(._links.web.href)"
+        ' 2>/dev/null)
 
     else
         build_check_failed=true
@@ -273,6 +309,9 @@ select(.sourceRepository.id as $rid | ($repos | split(" ") | index($rid)) != nul
     # Check active release pipelines
     releases_uri="https://vsrm.dev.azure.com/$enc_ado_org/$enc_ado_project/_apis/release/releases?api-version=7.1"
     releases_response=$(curl -s -H "Authorization: Bearer $ADO_PAT" -H "Content-Type: application/json" "$releases_uri" 2>/dev/null)
+    
+    # Get repo names for this project (for release artifact filtering)
+    repo_names="${PROJECT_REPO_NAMES["$ado_org|$ado_project"]}"
 
     if [ $? -eq 0 ] && [ -n "$releases_response" ]; then
         # Get release IDs
@@ -285,10 +324,36 @@ select(.sourceRepository.id as $rid | ($repos | split(" ") | index($rid)) != nul
                     # Check if any environments are in progress
                     running_envs=$(echo "$release_details" | jq -r '.environments[]? | select(.status == "inProgress") | "\(.name): \(.status)"' 2>/dev/null)
                     if [ -n "$running_envs" ]; then
-                        release_name=$(echo "$release_details" | jq -r '.name // ""' 2>/dev/null)
-                        env_statuses=$(echo "$running_envs" | tr '\n' ',' | sed 's/,$//')
-                        releaseUrl=$(echo "$release_details" | jq -r '._links.web.href // ""' 2>/dev/null)
-                        running_release_summary+=("$ado_project|$release_name|In Progress ($env_statuses)|$releaseUrl")
+                        # Check if this release is linked to any of our repos via artifacts
+                        # Release artifacts can have definitionReference.repository.name or be linked to build artifacts
+                        artifact_repos=$(echo "$release_details" | jq -r '
+                            .artifacts[]? | 
+                            (
+                                .definitionReference.repository.name // 
+                                .definitionReference.definition.name // 
+                                .alias // 
+                                ""
+                            ) | ascii_downcase
+                        ' 2>/dev/null | tr '\n' ' ')
+                        
+                        # Check if any artifact repo matches our CSV repos
+                        release_matches_repo=false
+                        for artifact_repo in $artifact_repos; do
+                            for csv_repo in $repo_names; do
+                                if [[ "$artifact_repo" == "$csv_repo" ]]; then
+                                    release_matches_repo=true
+                                    break 2
+                                fi
+                            done
+                        done
+                        
+                        # Only add to summary if release is linked to a repo in our CSV
+                        if [ "$release_matches_repo" = true ]; then
+                            release_name=$(echo "$release_details" | jq -r '.name // ""' 2>/dev/null)
+                            env_statuses=$(echo "$running_envs" | tr '\n' ',' | sed 's/,$//')
+                            releaseUrl=$(echo "$release_details" | jq -r '._links.web.href // ""' 2>/dev/null)
+                            running_release_summary+=("$ado_project|$release_name|In Progress ($env_statuses)|$releaseUrl")
+                        fi
                     fi
                 else
                     release_check_failed=true
@@ -376,11 +441,3 @@ else
     # Clean: no failures, no active items
     echo -e "\n\033[32mNo active pull requests or pipelines detected. You can proceed with migration.\033[0m\n"
 fi
-
-
-
-# Please find the attached bash script, that I am working on to do following enhancement.
-# When checking the active pipeline, currently, all active pipeline from the ADO project will displayed in summary. We need to filter to get active pipelines only from repository that are present in repos.csv. I have made changes to the bash script to filter YAML pipelines only for the repos present in repos.csv and tested it. So far it is working. But the following things are yet to be done
-# Add filter to check active release pipelines for repos that are present in repos.csv
-# After completing the changes, test the script and verify if both YAML and Release pipelines are filtered only for the repos that are present in repos.csv
-# I have worked only in bash for now, once bash is completed, we can implement the same change to PowerShell script also.
