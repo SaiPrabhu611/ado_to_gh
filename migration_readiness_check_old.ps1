@@ -18,6 +18,10 @@ $buildCheckFailed = $false
 $releaseCheckFailed = $false
 $prCheckFailed = $false
 
+# Hashtables to store repo IDs and names per project (key: "org|project")
+$PROJECT_REPO_IDS = @{}
+$PROJECT_REPO_NAMES = @{}
+
 # Read CSV file
 if (-not (Test-Path $CsvPath)) {
     Write-Host "[ERROR] CSV file '$CsvPath' not found. Exiting..." -ForegroundColor Red
@@ -153,6 +157,24 @@ foreach ($entry in $orgRepoList) {
                 Url        = "https://dev.azure.com/$orgEnc/$projEnc/_git/$repoEnc/pullrequest/$($pr.pullRequestId)"
             }
         }
+
+        # Build PROJECT_REPO_IDS and PROJECT_REPO_NAMES for pipeline filtering
+        $projectCombo = "$ADO_ORG|$ADO_PROJECT"
+
+        if ($repoId) {
+            if ($PROJECT_REPO_IDS.ContainsKey($projectCombo)) {
+                $PROJECT_REPO_IDS[$projectCombo] += $repoId
+            } else {
+                $PROJECT_REPO_IDS[$projectCombo] = @($repoId)
+            }
+
+            $repoNameLower = $selectedRepoName.ToLower()
+            if ($PROJECT_REPO_NAMES.ContainsKey($projectCombo)) {
+                $PROJECT_REPO_NAMES[$projectCombo] += $repoNameLower
+            } else {
+                $PROJECT_REPO_NAMES[$projectCombo] = @($repoNameLower)
+            }
+        }
     }
     catch {
         $prCheckFailed = $true
@@ -169,6 +191,10 @@ foreach ($project in $uniqueProjects) {
     $orgEnc = [System.Uri]::EscapeDataString($ADO_ORG)
     $projEnc = [System.Uri]::EscapeDataString($ADO_PROJECT)
 
+    $projectCombo = "$ADO_ORG|$ADO_PROJECT"
+    $repoIds = $PROJECT_REPO_IDS[$projectCombo]
+    $repoNames = $PROJECT_REPO_NAMES[$projectCombo]
+
     # Check active build pipelines
     try {
         $buildsUri = "https://dev.azure.com/$ADO_ORG/$ADO_PROJECT/_apis/build/builds?api-version=7.1"
@@ -179,11 +205,15 @@ foreach ($project in $uniqueProjects) {
         # Reference: List of available build status values – https://learn.microsoft.com/en-us/rest/api/azure/devops/build/builds/list?view=azure-devops-rest-7.1#buildstatus
 
         foreach ($build in $notCompletedBuilds) {
-            $runningBuildSummary += @{
-                Project  = $ADO_PROJECT
-                Pipeline = $build.definition.name
-                Status   = "In Progress/ Queued"
-                RunUrl   = $build._links.web.href
+            # Filter by repo ID - only include builds tied to repos in the CSV
+            if ($repoIds -and $build.repository.id -in $repoIds) {
+                $runningBuildSummary += @{
+                    Project    = $ADO_PROJECT
+                    Repository = $build.repository.name
+                    Pipeline   = $build.definition.name
+                    Status     = "In Progress/ Queued"
+                    RunUrl     = $build._links.web.href
+                }
             }
         }
     }
@@ -211,12 +241,37 @@ foreach ($project in $uniqueProjects) {
                 # Reference: Environment status values – https://learn.microsoft.com/en-us/rest/api/azure/devops/release/releases/get-release?view=azure-devops-rest-7.1&tabs=HTTP#environmentstatus
 
                 if ($runningEnvironments -and @($runningEnvironments).Count -gt 0) {
-                    $environmentStatuses = ($runningEnvironments | ForEach-Object { "$($_.name): $($_.status)" }) -join ", "
-                    $runningReleaseSummary += @{
-                        Project = $ADO_PROJECT
-                        Name    = $releaseDetails.name
-                        Status  = "In Progress ($environmentStatuses)"
-                        Url     = $releaseDetails._links.web.href
+                    # Filter by repo name via artifact matching - only include releases tied to repos in the CSV
+                    $releaseMatchesRepo = $false
+
+                    if ($repoNames -and $releaseDetails.artifacts) {
+                        foreach ($artifact in $releaseDetails.artifacts) {
+                            $artifactRepo = $null
+
+                            # Try different paths to get the repo/definition name
+                            if ($artifact.definitionReference.repository.name) {
+                                $artifactRepo = $artifact.definitionReference.repository.name.ToLower()
+                            } elseif ($artifact.definitionReference.definition.name) {
+                                $artifactRepo = $artifact.definitionReference.definition.name.ToLower()
+                            } elseif ($artifact.alias) {
+                                $artifactRepo = $artifact.alias.ToLower()
+                            }
+
+                            if ($artifactRepo -and ($artifactRepo -in $repoNames)) {
+                                $releaseMatchesRepo = $true
+                                break
+                            }
+                        }
+                    }
+
+                    if ($releaseMatchesRepo) {
+                        $environmentStatuses = ($runningEnvironments | ForEach-Object { "$($_.name): $($_.status)" }) -join ", "
+                        $runningReleaseSummary += @{
+                            Project = $ADO_PROJECT
+                            Name    = $releaseDetails.name
+                            Status  = "In Progress ($environmentStatuses)"
+                            Url     = $releaseDetails._links.web.href
+                        }
                     }
                 }
             }
@@ -253,7 +308,7 @@ if (-not $buildCheckFailed) {
     if ($runningBuildSummary.Count -gt 0) {
         Write-Host "`n[WARNING] Detected Running Build Pipeline(s):" -ForegroundColor Yellow
         foreach ($entry in $runningBuildSummary) {
-            Write-Host "Project: $($entry.Project) | Pipeline: $($entry.Pipeline) | Status: $($entry.Status)"
+            Write-Host "Project: $($entry.Project) | Repository: $($entry.Repository) | Pipeline: $($entry.Pipeline) | Status: $($entry.Status)"
             Write-Host "Run URL: $($entry.RunUrl)`n"
         }
     }
